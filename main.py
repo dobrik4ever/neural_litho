@@ -7,9 +7,10 @@ import numpy as np
 from matplotlib import pyplot as plt
 from tqdm import tqdm, trange
 import json
+import torch.nn.functional as F
 
 
-device_name = 'mps' # cuda or cpu or mps
+device_name = 'cpu' # cuda or cpu or mps
 device = torch.device(f'{device_name}:0')
 
 # === Parameters === #
@@ -35,7 +36,7 @@ resist_thickness = 30.0
 USE_PRETRAINED_MODEL = False
 
 if USE_PRETRAINED_MODEL:
-    pretrained_model_fname = 'pretrained_model.pt'
+    pretrained_model_fname = 'model_runs/run_2024.07.29_11:25:25/model.pt'
     if not os.path.exists(pretrained_model_fname):
         USE_PRETRAINED_MODEL = False
         raise RuntimeError(f'Pretrained model {pretrained_model_fname} not found')
@@ -59,25 +60,25 @@ class Parameters:
 
 
 class TrainingParameters(Parameters):
-    plotting_interval = 10
-    batch_size = 50
+    plotting_interval = 1
+    batch_size = 10
     split_percent = 0.1  # How many percent of the data will be used for testing
     shuffle_dataset = False
     learning_rate = 1e-4
     num_epochs = 1000
     early_stopping_patience = 5
     optimizer = torch.optim.Adam
-    loss_function = torch.nn.BCELoss()
+    loss_function = torch.nn.MSELoss()
 
 
 class OptimizationParameters(Parameters):
     target_mask_fname = '../Neural_Lithography/data/printed_data/mask/data_0.npy' #'Mask_target.npy'
     target_dart_fname = '../Neural_Lithography/data/printed_data/afm/data_0.npy' #'Dart_target.npy'
     plotting_interval = 100
-    learning_rate = 10
-    num_epochs = 1000
+    learning_rate = 1e-2
+    num_epochs = 10000
     optimizer = torch.optim.SGD
-    loss_function = torch.nn.BCELoss()
+    loss_function = torch.nn.MSELoss()
 
 
 json_dict['training'] = {'parameters': TrainingParameters.to_dict()}
@@ -197,7 +198,7 @@ class Dataset(torch.utils.data.Dataset):
 
         assert os.path.basename(mask_fname) == os.path.basename(dart_fname)
         mask = np.load(mask_fname).astype(np.float32)[np.newaxis, ...]
-        dart = np.load(dart_fname).astype(np.float32)[np.newaxis, ...] / resist_thickness # Resist thickness
+        dart = np.load(dart_fname).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
 
         return mask, dart
 
@@ -285,15 +286,81 @@ class NeuralLitho(nn.Module):
         super().__init__()
         self.point1 = NeuralPointwiseNet()
         self.area1 = NeuralAreawiseNet()
-        self.intensity_threshold = nn.Parameter(torch.tensor([1.0]))
-        self.scale_factor = nn.Parameter(torch.tensor([0.1]))
+        self.sigmac_range = 0.25
+        self.sigmac_param = nn.Parameter(torch.tensor(0.2))
+        self.shrink_approx = NeuralPointwiseNet()
+        self.out_layer = NeuralAreawiseNet()
+
+    def create_gaussian_kernel(self, sigma):
+        stepxy = int(sigma * 6 + 1)
+        rangexy = stepxy // 2
+        xycord = torch.linspace(-rangexy, rangexy, steps=stepxy).to(device)
+        kernel = torch.exp(-(xycord[:, None]**2 + xycord[None, :]**2) / (2 * sigma**2))
+        kernel = kernel / torch.sum(kernel)
+        return kernel[None, None]
+
+    def get_aerial_image(self, masks):
+        illum_kernel = self.create_gaussian_kernel(0.2)  # Fixed sigmao
+        aerial_image = conv2d(masks, illum_kernel, intensity_output=True)
+        return aerial_image
+
+    def get_resist_image(self, aerial_image):
+        # Thresholding
+        exposure = self.point1(aerial_image)
+        sigmac = torch.sigmoid(self.sigmac_param) * self.sigmac_range
+        diffusion_kernel = self.create_gaussian_kernel(sigmac.item())
+        diffusion = conv2d(exposure, diffusion_kernel, intensity_output=True)
+        shrinkage = self.shrink_approx(diffusion)
+        resist_image = self.out_layer(exposure * shrinkage)
+        return resist_image
 
     def forward(self, input_tensor):
-        x1 = self.area1(input_tensor)
-        x2 = self.point1(input_tensor)
-        x3 = self.scale_factor * torch.sigmoid(x2 + self.intensity_threshold)
-        scaled_output = x1 * x3
-        return scaled_output
+        aerial_image = self.get_aerial_image(input_tensor)
+        resist_image = self.get_resist_image(aerial_image)
+        return resist_image
+    
+def conv2d(obj, psf, shape="same", intensity_output=False):
+    _, _, im_height, im_width = obj.shape
+    output_size_x = obj.shape[-2] + psf.shape[-2] - 1
+    output_size_y = obj.shape[-1] + psf.shape[-1] - 1
+
+    p2d_psf = (0, output_size_y - psf.shape[-1], 0, output_size_x - psf.shape[-2])
+    p2d_obj = (0, output_size_y - obj.shape[-1], 0, output_size_x - obj.shape[-2])
+    psf_padded = F.pad(psf, p2d_psf, mode="constant", value=0)
+    obj_padded = F.pad(obj, p2d_obj, mode="constant", value=0)
+
+    obj_fft = torch.fft.fft2(obj_padded)
+    otf_padded = torch.fft.fft2(psf_padded)
+
+    frequency_conv = obj_fft * otf_padded
+    convolved = torch.fft.ifft2(frequency_conv)
+
+    if shape == "same":
+        convolved = central_crop(convolved, im_height, im_width)
+    else:
+        raise NotImplementedError
+
+    if intensity_output:
+        convolved = torch.abs(convolved)
+
+    return convolved
+
+def central_crop(variable, tw=None, th=None, dim=2):
+    if dim == 2:
+        w = variable.shape[-2]
+        h = variable.shape[-1]
+        if th is None:
+            th = tw
+        x1 = int(round((w - tw) / 2.0))
+        y1 = int(round((h - th) / 2.0))
+        cropped = variable[..., x1: x1 + tw, y1: y1 + th]
+    elif dim == 1:
+        h = variable.shape[-1]
+        y1 = int(round((h - th) / 2.0))
+        cropped = variable[..., y1: y1 + th]
+    else:
+        raise NotImplementedError
+    return cropped
 
 
 def train_litho_model(parameters: TrainingParameters) -> NeuralLitho:
@@ -359,7 +426,7 @@ def train_litho_model(parameters: TrainingParameters) -> NeuralLitho:
                     break
 
             t_range.set_description(
-                f'Epoch {epoch} Loss: {valid_losses[-1]:.6f} counter: {early_stopping_counter} of {parameters.early_stopping_patience} {model.intensity_threshold.item()} {model.scale_factor.item()=} {model.scale_factor.item()=} ')
+                f'Epoch {epoch} Loss: {valid_losses[-1]:.6f} counter: {early_stopping_counter} of {parameters.early_stopping_patience} ')
             t_range.update()
     except KeyboardInterrupt:
         print('Training interrupted')
@@ -377,6 +444,7 @@ def optimize_mask(parameters: OptimizationParameters, model: NeuralLitho):
 
     # Put everything in tensors
     mask = np.ones_like(mask_sim)*0.5
+    # mask = np.random.uniform(0, 1, mask_sim.shape) 
     model_input = torch.tensor(
         mask[np.newaxis, np.newaxis, ...], device=device, dtype=torch.float32, requires_grad=True)
     dart_target = torch.tensor(
