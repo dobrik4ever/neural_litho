@@ -30,6 +30,7 @@ folder_training_output = os.path.join(
     folder_training_data, 'afm')  # Folder with training output
 
 # == Train and Optimization parameters == #
+resist_thickness = 30.0
 
 USE_PRETRAINED_MODEL = False
 
@@ -59,24 +60,24 @@ class Parameters:
 
 class TrainingParameters(Parameters):
     plotting_interval = 10
-    batch_size = 10
+    batch_size = 50
     split_percent = 0.1  # How many percent of the data will be used for testing
     shuffle_dataset = False
     learning_rate = 1e-4
     num_epochs = 1000
     early_stopping_patience = 5
     optimizer = torch.optim.Adam
-    loss_function = torch.nn.MSELoss()
+    loss_function = torch.nn.BCELoss()
 
 
 class OptimizationParameters(Parameters):
-    target_mask_fname = 'Mask_target.npy'
-    target_dart_fname = 'Dart_target.npy'
+    target_mask_fname = '../Neural_Lithography/data/printed_data/mask/data_0.npy' #'Mask_target.npy'
+    target_dart_fname = '../Neural_Lithography/data/printed_data/afm/data_0.npy' #'Dart_target.npy'
     plotting_interval = 100
-    learning_rate = 1e-1
+    learning_rate = 10
     num_epochs = 1000
     optimizer = torch.optim.SGD
-    loss_function = torch.nn.MSELoss()
+    loss_function = torch.nn.BCELoss()
 
 
 json_dict['training'] = {'parameters': TrainingParameters.to_dict()}
@@ -89,6 +90,8 @@ if not os.path.exists(folder_with_experiments):  # Make sure the folder exists
 shutil.copyfile('main.py', os.path.join(folder_with_experiments,
                 f'main_{NOW}.py'))  # Copy file to the run folder
 
+with open(os.path.join(folder_with_experiments, 'results.json'), 'w') as f:
+    json.dump(json_dict, f, indent=4)
 
 def detensor(tensor):
     return tensor.cpu().detach().numpy()[0, 0]
@@ -194,7 +197,7 @@ class Dataset(torch.utils.data.Dataset):
 
         assert os.path.basename(mask_fname) == os.path.basename(dart_fname)
         mask = np.load(mask_fname).astype(np.float32)[np.newaxis, ...]
-        dart = np.load(dart_fname).astype(np.float32)[np.newaxis, ...]
+        dart = np.load(dart_fname).astype(np.float32)[np.newaxis, ...] / resist_thickness # Resist thickness
 
         return mask, dart
 
@@ -280,13 +283,17 @@ class NeuralLitho(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.pointwise_net = NeuralPointwiseNet()
-        self.areawise_net = NeuralAreawiseNet()
+        self.point1 = NeuralPointwiseNet()
+        self.area1 = NeuralAreawiseNet()
+        self.intensity_threshold = nn.Parameter(torch.tensor([1.0]))
+        self.scale_factor = nn.Parameter(torch.tensor([0.1]))
 
     def forward(self, input_tensor):
-        point = self.pointwise_net(input_tensor)
-        area = self.areawise_net(input_tensor)
-        return point + area
+        x1 = self.area1(input_tensor)
+        x2 = self.point1(input_tensor)
+        x3 = self.scale_factor * torch.sigmoid(x2 + self.intensity_threshold)
+        scaled_output = x1 * x3
+        return scaled_output
 
 
 def train_litho_model(parameters: TrainingParameters) -> NeuralLitho:
@@ -305,53 +312,58 @@ def train_litho_model(parameters: TrainingParameters) -> NeuralLitho:
     json_dict['training']['losses'] = {
         'train': train_losses, 'validation': valid_losses}
     t_range = trange(parameters.num_epochs)
-    for epoch in t_range:
+    try:
+        for epoch in t_range:
 
-        # Training
-        train_losses_local = []
-        model.train()
-        for mask, dart in train_dataloader:
+            # Training
+            train_losses_local = []
+            model.train()
+            for mask, dart in train_dataloader:
 
-            optimizer.zero_grad()
-            output = model(mask)
-            loss = parameters.loss_function(output, dart)
+                optimizer.zero_grad()
+                output = model(mask)
+                loss = parameters.loss_function(output, dart)
 
-            train_losses_local.append(loss.item())
-            loss.backward()
-            optimizer.step()
+                train_losses_local.append(loss.item())
+                loss.backward()
+                optimizer.step()
 
-        train_losses.append(np.mean(train_losses_local))
+            train_losses.append(np.mean(train_losses_local))
 
-        # Validation
-        valid_losses_local = []
-        model.eval()
-        for mask, dart in train_dataloader:
+            # Validation
+            valid_losses_local = []
+            model.eval()
+            for mask, dart in train_dataloader:
 
-            output = model(mask)
-            loss = parameters.loss_function(output, dart)
-            valid_losses_local.append(loss.item())
+                output = model(mask)
+                loss = parameters.loss_function(output, dart)
+                valid_losses_local.append(loss.item())
 
-        valid_losses.append(np.mean(valid_losses_local))
+            valid_losses.append(np.mean(valid_losses_local))
 
-        # Plotting
-        if epoch % parameters.plotting_interval == 0:
-            plot_training(test_dataloader, model, train_losses,
-                          valid_losses, folder_with_experiments)
+            # Plotting
+            if epoch % parameters.plotting_interval == 0:
+                plot_training(test_dataloader, model, train_losses,
+                            valid_losses, folder_with_experiments)
 
-        # Early stopping and saving
-        if valid_losses[-1] < best_val_loss:
-            best_val_loss = valid_losses[-1]
-            torch.save(model.state_dict(), os.path.join(
-                folder_with_experiments, f'model.pt'))
-        else:
-            early_stopping_counter += 1
-            if early_stopping_counter > parameters.early_stopping_patience:
-                break
+            # Early stopping and saving
+            if valid_losses[-1] < best_val_loss:
+                early_stopping_counter = 0
 
-        t_range.set_description(
-            f'Epoch {epoch} Loss: {valid_losses[-1]:.6f} Stopping counter: {early_stopping_counter} of {parameters.early_stopping_patience}')
-        t_range.update()
+                best_val_loss = valid_losses[-1]
+                torch.save(model.state_dict(), os.path.join(
+                    folder_with_experiments, f'model.pt'))
+            else:
+                early_stopping_counter += 1
+                if early_stopping_counter > parameters.early_stopping_patience:
+                    break
 
+            t_range.set_description(
+                f'Epoch {epoch} Loss: {valid_losses[-1]:.6f} counter: {early_stopping_counter} of {parameters.early_stopping_patience} {model.intensity_threshold.item()} {model.scale_factor.item()=} {model.scale_factor.item()=} ')
+            t_range.update()
+    except KeyboardInterrupt:
+        print('Training interrupted')
+        
     with open(os.path.join(folder_with_experiments, 'results.json'), 'w') as f:
         json.dump(json_dict, f, indent=4)
 
@@ -378,25 +390,27 @@ def optimize_mask(parameters: OptimizationParameters, model: NeuralLitho):
     json_dict['optimization']['loss'] = array_losses
 
     t_range = trange(parameters.num_epochs)
-    for epoch in t_range:
+    try:
+        for epoch in t_range:
+            optimizer.zero_grad()
+            # x = torch.clamp(model_input, 0.0, 1.0)
+            x = model_input
+            dart_pred = model.forward(x)
+            loss = parameters.loss_function(dart_pred, dart_target)
+            loss.backward()
 
-        optimizer.zero_grad()
-        # x = torch.clamp(model_input, 0.0, 1.0)
-        x = model_input
-        dart_pred = model.forward(x)
-        loss = parameters.loss_function(dart_pred, dart_target)
-        loss.backward()
+            optimizer.step()
 
-        optimizer.step()
+            array_losses.append(loss.item())
+            t_range.set_description(f'Epoch {epoch} Loss: {array_losses[-1]:.6f}')
+            t_range.update()
 
-        array_losses.append(loss.item())
-        t_range.set_description(f'Epoch {epoch} Loss: {array_losses[-1]:.6f}')
-        t_range.update()
-
-        # Plotting
-        if epoch % parameters.plotting_interval == 0:
-            plot_optimization(model_input, dart_pred, dart_sim,
-                              mask_sim, array_losses, folder_with_experiments)
+            # Plotting
+            if epoch % parameters.plotting_interval == 0:
+                plot_optimization(model_input, dart_pred, dart_sim,
+                                mask_sim, array_losses, folder_with_experiments)
+    except KeyboardInterrupt:
+        print('Optimization interrupted')
 
     np.save(os.path.join(folder_with_experiments,
             'final_mask.npy'), detensor(model_input))
@@ -407,9 +421,10 @@ def optimize_mask(parameters: OptimizationParameters, model: NeuralLitho):
 
 
 if __name__ == '__main__':
+    print('Starting', NOW)
     if USE_PRETRAINED_MODEL:
         print(f'Using pretrained model {pretrained_model_fname}')
-        model = NeuralLitho()
+        model = NeuralLitho().to(device)
         model.load_state_dict(torch.load(pretrained_model_fname))
         model.to(device)
         model.eval()
