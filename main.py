@@ -8,16 +8,18 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm, trange
 import json
 import torch.nn.functional as F
+from skimage import transform
 
 
-device_name = 'cpu' # cuda or cpu or mps
+device_name = 'mps' # cuda or cpu or mps
 device = torch.device(f'{device_name}:0')
 
 # === Parameters === #
 
 # == Environment == #
 INPLACE = False  # If True, the current run will not be saved in a separate folder but instead will overwrite the 'inplace' run
-NOW = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')  # ID for the current run
+time_format = '%Y.%m.%d_%H:%M:%S'
+NOW = datetime.now().strftime(time_format)  # ID for the current run
 json_dict = {'time': NOW}
 NOW = 'inplace' if INPLACE else NOW
 # Folder where the experiments will be stored
@@ -36,7 +38,7 @@ resist_thickness = 30.0
 USE_PRETRAINED_MODEL = False
 
 if USE_PRETRAINED_MODEL:
-    pretrained_model_fname = 'model_runs/run_2024.07.29_11:25:25/model.pt'
+    pretrained_model_fname = 'model_runs/run_2024.07.29_18:23:15/model.pt'
     if not os.path.exists(pretrained_model_fname):
         USE_PRETRAINED_MODEL = False
         raise RuntimeError(f'Pretrained model {pretrained_model_fname} not found')
@@ -58,13 +60,13 @@ class Parameters:
                 output[key] = repr(val)
         return output
 
-
+shape = [104, 104]
 class TrainingParameters(Parameters):
     plotting_interval = 1
     batch_size = 10
     split_percent = 0.1  # How many percent of the data will be used for testing
     shuffle_dataset = False
-    learning_rate = 1e-4
+    learning_rate = 1e-5
     num_epochs = 1000
     early_stopping_patience = 5
     optimizer = torch.optim.Adam
@@ -75,7 +77,7 @@ class OptimizationParameters(Parameters):
     target_mask_fname = '../Neural_Lithography/data/printed_data/mask/data_0.npy' #'Mask_target.npy'
     target_dart_fname = '../Neural_Lithography/data/printed_data/afm/data_0.npy' #'Dart_target.npy'
     plotting_interval = 100
-    learning_rate = 1e-2
+    learning_rate = 1
     num_epochs = 10000
     optimizer = torch.optim.SGD
     loss_function = torch.nn.MSELoss()
@@ -197,8 +199,8 @@ class Dataset(torch.utils.data.Dataset):
         dart_fname = self.dart_files[idx]
 
         assert os.path.basename(mask_fname) == os.path.basename(dart_fname)
-        mask = np.load(mask_fname).astype(np.float32)[np.newaxis, ...]
-        dart = np.load(dart_fname).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
+        mask = transform.resize(np.load(mask_fname), shape).astype(np.float32)[np.newaxis, ...]
+        dart = transform.resize(np.load(dart_fname), shape).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
 
         return mask, dart
 
@@ -280,45 +282,109 @@ class NeuralAreawiseNet(nn.Module):
         return x
 
 
-class NeuralLitho(nn.Module):
+# class NeuralLitho(nn.Module):
 
-    def __init__(self):
+#     def __init__(self):
+#         super().__init__()
+#         self.point1 = NeuralPointwiseNet()
+#         self.area1 = NeuralAreawiseNet()
+#         self.sigmac_range = 0.25
+#         self.sigmac_param = nn.Parameter(torch.tensor(0.2))
+#         self.shrink_approx = NeuralPointwiseNet()
+#         self.out_layer = NeuralAreawiseNet()
+
+#     def create_gaussian_kernel(self, sigma):
+#         stepxy = int(sigma * 6 + 1)
+#         rangexy = stepxy // 2
+#         xycord = torch.linspace(-rangexy, rangexy, steps=stepxy).to(device)
+#         kernel = torch.exp(-(xycord[:, None]**2 + xycord[None, :]**2) / (2 * sigma**2))
+#         kernel = kernel / torch.sum(kernel)
+#         return kernel[None, None]
+
+#     def get_aerial_image(self, masks):
+#         illum_kernel = self.create_gaussian_kernel(0.2)  # Fixed sigmao
+#         aerial_image = conv2d(masks, illum_kernel, intensity_output=True)
+#         return aerial_image
+
+#     def get_resist_image(self, aerial_image):
+#         # Thresholding
+#         exposure = self.point1(aerial_image)
+#         sigmac = torch.sigmoid(self.sigmac_param) * self.sigmac_range
+#         diffusion_kernel = self.create_gaussian_kernel(sigmac.item())
+#         diffusion = conv2d(exposure, diffusion_kernel, intensity_output=True)
+#         shrinkage = self.shrink_approx(diffusion)
+#         resist_image = self.out_layer(exposure * shrinkage)
+#         return resist_image
+
+#     def forward(self, input_tensor):
+#         aerial_image = self.get_aerial_image(input_tensor)
+#         resist_image = self.get_resist_image(aerial_image)
+#         return resist_image
+
+import torch
+import torch.nn as nn
+
+def double_conv(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, 3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        nn.ReLU(inplace=True)
+    )   
+
+
+class UNet(nn.Module):
+
+    def __init__(self, n_class=1):
         super().__init__()
-        self.point1 = NeuralPointwiseNet()
-        self.area1 = NeuralAreawiseNet()
-        self.sigmac_range = 0.25
-        self.sigmac_param = nn.Parameter(torch.tensor(0.2))
-        self.shrink_approx = NeuralPointwiseNet()
-        self.out_layer = NeuralAreawiseNet()
+                
+        self.dconv_down1 = double_conv(1, 64)
+        self.dconv_down2 = double_conv(64, 128)
+        self.dconv_down3 = double_conv(128, 256)
+        self.dconv_down4 = double_conv(256, 512)        
 
-    def create_gaussian_kernel(self, sigma):
-        stepxy = int(sigma * 6 + 1)
-        rangexy = stepxy // 2
-        xycord = torch.linspace(-rangexy, rangexy, steps=stepxy).to(device)
-        kernel = torch.exp(-(xycord[:, None]**2 + xycord[None, :]**2) / (2 * sigma**2))
-        kernel = kernel / torch.sum(kernel)
-        return kernel[None, None]
+        self.maxpool = nn.MaxPool2d(2)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)        
+        
+        self.dconv_up3 = double_conv(256 + 512, 256)
+        self.dconv_up2 = double_conv(128 + 256, 128)
+        self.dconv_up1 = double_conv(128 + 64, 64)
+        
+        self.conv_last = nn.Conv2d(64, n_class, 1)
+        self.sigm = nn.Sigmoid()
+        
+        
+    def forward(self, x):
+        x = self.sigm(x)
+        conv1 = self.dconv_down1(x)
+        x = self.maxpool(conv1)
 
-    def get_aerial_image(self, masks):
-        illum_kernel = self.create_gaussian_kernel(0.2)  # Fixed sigmao
-        aerial_image = conv2d(masks, illum_kernel, intensity_output=True)
-        return aerial_image
+        conv2 = self.dconv_down2(x)
+        x = self.maxpool(conv2)
+        
+        conv3 = self.dconv_down3(x)
+        x = self.maxpool(conv3)   
+        
+        x = self.dconv_down4(x)
+        
+        x = self.upsample(x)        
+        x = torch.cat([x, conv3], dim=1)
+        
+        x = self.dconv_up3(x)
+        x = self.upsample(x)        
+        x = torch.cat([x, conv2], dim=1)       
 
-    def get_resist_image(self, aerial_image):
-        # Thresholding
-        exposure = self.point1(aerial_image)
-        sigmac = torch.sigmoid(self.sigmac_param) * self.sigmac_range
-        diffusion_kernel = self.create_gaussian_kernel(sigmac.item())
-        diffusion = conv2d(exposure, diffusion_kernel, intensity_output=True)
-        shrinkage = self.shrink_approx(diffusion)
-        resist_image = self.out_layer(exposure * shrinkage)
-        return resist_image
-
-    def forward(self, input_tensor):
-        aerial_image = self.get_aerial_image(input_tensor)
-        resist_image = self.get_resist_image(aerial_image)
-        return resist_image
+        x = self.dconv_up2(x)
+        x = self.upsample(x)        
+        x = torch.cat([x, conv1], dim=1)   
+        
+        x = self.dconv_up1(x)
+        
+        out = self.conv_last(x)
+        
+        return out   
     
+
 def conv2d(obj, psf, shape="same", intensity_output=False):
     _, _, im_height, im_width = obj.shape
     output_size_x = obj.shape[-2] + psf.shape[-2] - 1
@@ -363,13 +429,13 @@ def central_crop(variable, tw=None, th=None, dim=2):
     return cropped
 
 
-def train_litho_model(parameters: TrainingParameters) -> NeuralLitho:
+def train_litho_model(parameters: TrainingParameters) -> UNet:
     dataset = Dataset(folder_training_input, folder_training_output)
     train_dataloader, test_dataloader = create_dataloaders(
         dataset, split_percent=parameters.split_percent,
         bs=parameters.batch_size, shuffle=parameters.shuffle_dataset)
 
-    model = NeuralLitho().to(device)
+    model = UNet().to(device)
     optimizer = parameters.optimizer(
         model.parameters(), lr=parameters.learning_rate)
     train_losses = []
@@ -437,10 +503,10 @@ def train_litho_model(parameters: TrainingParameters) -> NeuralLitho:
     return model
 
 
-def optimize_mask(parameters: OptimizationParameters, model: NeuralLitho):
+def optimize_mask(parameters: OptimizationParameters, model: UNet):
 
-    dart_sim = np.load(parameters.target_dart_fname)
-    mask_sim = np.load(parameters.target_mask_fname)
+    dart_sim = transform.resize(np.load(parameters.target_dart_fname), [104, 104])
+    mask_sim = transform.resize(np.load(parameters.target_mask_fname), [104, 104])
 
     # Put everything in tensors
     mask = np.ones_like(mask_sim)*0.5
@@ -492,7 +558,7 @@ if __name__ == '__main__':
     print('Starting', NOW)
     if USE_PRETRAINED_MODEL:
         print(f'Using pretrained model {pretrained_model_fname}')
-        model = NeuralLitho().to(device)
+        model = UNet().to(device)
         model.load_state_dict(torch.load(pretrained_model_fname))
         model.to(device)
         model.eval()
