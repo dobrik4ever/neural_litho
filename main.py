@@ -18,8 +18,7 @@ device = torch.device(f'{device_name}:0')
 
 # == Environment == #
 INPLACE = False  # If True, the current run will not be saved in a separate folder but instead will overwrite the 'inplace' run
-time_format = '%Y.%m.%d_%H:%M:%S'
-NOW = datetime.now().strftime(time_format)  # ID for the current run
+NOW = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')  # ID for the current run
 json_dict = {'time': NOW}
 NOW = 'inplace' if INPLACE else NOW
 # Folder where the experiments will be stored
@@ -35,7 +34,7 @@ folder_training_output = os.path.join(
 # == Train and Optimization parameters == #
 resist_thickness = 30.0
 
-USE_PRETRAINED_MODEL = False
+USE_PRETRAINED_MODEL = True
 
 if USE_PRETRAINED_MODEL:
     pretrained_model_fname = 'model_runs/run_2024.07.29_18:23:15/model.pt'
@@ -60,13 +59,13 @@ class Parameters:
                 output[key] = repr(val)
         return output
 
-shape = [104, 104]
+
 class TrainingParameters(Parameters):
     plotting_interval = 1
     batch_size = 10
     split_percent = 0.1  # How many percent of the data will be used for testing
     shuffle_dataset = False
-    learning_rate = 1e-5
+    learning_rate = 1e-4
     num_epochs = 1000
     early_stopping_patience = 5
     optimizer = torch.optim.Adam
@@ -199,8 +198,9 @@ class Dataset(torch.utils.data.Dataset):
         dart_fname = self.dart_files[idx]
 
         assert os.path.basename(mask_fname) == os.path.basename(dart_fname)
-        mask = transform.resize(np.load(mask_fname), shape).astype(np.float32)[np.newaxis, ...]
-        dart = transform.resize(np.load(dart_fname), shape).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
+        N = 104
+        mask = transform.resize(np.load(mask_fname), [N,N]).astype(np.float32)[np.newaxis, ...]
+        dart = transform.resize(np.load(dart_fname), [N,N]).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
 
         return mask, dart
 
@@ -351,11 +351,9 @@ class UNet(nn.Module):
         self.dconv_up1 = double_conv(128 + 64, 64)
         
         self.conv_last = nn.Conv2d(64, n_class, 1)
-        self.sigm = nn.Sigmoid()
         
         
     def forward(self, x):
-        x = self.sigm(x)
         conv1 = self.dconv_down1(x)
         x = self.maxpool(conv1)
 
