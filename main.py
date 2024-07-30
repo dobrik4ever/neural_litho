@@ -18,7 +18,8 @@ device = torch.device(f'{device_name}:0')
 
 # == Environment == #
 INPLACE = False  # If True, the current run will not be saved in a separate folder but instead will overwrite the 'inplace' run
-NOW = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')  # ID for the current run
+time_format = '%Y.%m.%d_%H:%M:%S'
+NOW = datetime.now().strftime(time_format)  # ID for the current run
 json_dict = {'time': NOW}
 NOW = 'inplace' if INPLACE else NOW
 # Folder where the experiments will be stored
@@ -34,7 +35,7 @@ folder_training_output = os.path.join(
 # == Train and Optimization parameters == #
 resist_thickness = 30.0
 
-USE_PRETRAINED_MODEL = True
+USE_PRETRAINED_MODEL = False
 
 if USE_PRETRAINED_MODEL:
     pretrained_model_fname = 'model_runs/run_2024.07.29_18:23:15/model.pt'
@@ -321,22 +322,18 @@ class NeuralAreawiseNet(nn.Module):
 #         resist_image = self.get_resist_image(aerial_image)
 #         return resist_image
 
-import torch
-import torch.nn as nn
 
 def double_conv(in_channels, out_channels):
     return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels, 3, padding=1),
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
         nn.ReLU(inplace=True)
-    )   
-
+    )
 
 class UNet(nn.Module):
-
     def __init__(self, n_class=1):
-        super().__init__()
+        super(UNet, self).__init__()
                 
         self.dconv_down1 = double_conv(1, 64)
         self.dconv_down2 = double_conv(64, 128)
@@ -344,16 +341,20 @@ class UNet(nn.Module):
         self.dconv_down4 = double_conv(256, 512)        
 
         self.maxpool = nn.MaxPool2d(2)
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)        
         
-        self.dconv_up3 = double_conv(256 + 512, 256)
-        self.dconv_up2 = double_conv(128 + 256, 128)
-        self.dconv_up1 = double_conv(128 + 64, 64)
+        # Transposed convolutions for upsampling
+        self.up_transpose3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.up_transpose2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.up_transpose1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
         
-        self.conv_last = nn.Conv2d(64, n_class, 1)
+        self.dconv_up3 = double_conv(256 + 256, 256)  # 256 from upsampled, 256 from conv3
+        self.dconv_up2 = double_conv(128 + 128, 128)  # 128 from upsampled, 128 from conv2
+        self.dconv_up1 = double_conv(64 + 64, 64)     # 64 from upsampled, 64 from conv1
         
+        self.conv_last = nn.Conv2d(64, n_class, kernel_size=1)
         
     def forward(self, x):
+        # Down path
         conv1 = self.dconv_down1(x)
         x = self.maxpool(conv1)
 
@@ -365,22 +366,22 @@ class UNet(nn.Module):
         
         x = self.dconv_down4(x)
         
-        x = self.upsample(x)        
+        # Up path
+        x = self.up_transpose3(x)        
         x = torch.cat([x, conv3], dim=1)
-        
         x = self.dconv_up3(x)
-        x = self.upsample(x)        
-        x = torch.cat([x, conv2], dim=1)       
-
-        x = self.dconv_up2(x)
-        x = self.upsample(x)        
-        x = torch.cat([x, conv1], dim=1)   
         
+        x = self.up_transpose2(x)        
+        x = torch.cat([x, conv2], dim=1)       
+        x = self.dconv_up2(x)
+        
+        x = self.up_transpose1(x)        
+        x = torch.cat([x, conv1], dim=1)   
         x = self.dconv_up1(x)
         
         out = self.conv_last(x)
         
-        return out   
+        return out 
     
 
 def conv2d(obj, psf, shape="same", intensity_output=False):
