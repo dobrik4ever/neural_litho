@@ -45,6 +45,8 @@ if USE_PRETRAINED_MODEL:
 else:
     pretrained_model_fname = None
 
+in_out_shape = 100 # Shape of mask and dart
+
 
 class Parameters:
 
@@ -62,13 +64,13 @@ class Parameters:
 
 
 class TrainingParameters(Parameters):
-    plotting_interval = 1
+    plotting_interval = 10
     batch_size = 10
     split_percent = 0.1  # How many percent of the data will be used for testing
     shuffle_dataset = False
     learning_rate = 1e-4
     num_epochs = 1000
-    early_stopping_patience = 5
+    early_stopping_patience = 20
     optimizer = torch.optim.Adam
     loss_function = torch.nn.MSELoss()
 
@@ -77,7 +79,7 @@ class OptimizationParameters(Parameters):
     target_mask_fname = '../Neural_Lithography/data/printed_data/mask/data_0.npy' #'Mask_target.npy'
     target_dart_fname = '../Neural_Lithography/data/printed_data/afm/data_0.npy' #'Dart_target.npy'
     plotting_interval = 100
-    learning_rate = 1
+    learning_rate = 1e-2
     num_epochs = 10000
     optimizer = torch.optim.SGD
     loss_function = torch.nn.MSELoss()
@@ -199,9 +201,8 @@ class Dataset(torch.utils.data.Dataset):
         dart_fname = self.dart_files[idx]
 
         assert os.path.basename(mask_fname) == os.path.basename(dart_fname)
-        N = 104
-        mask = transform.resize(np.load(mask_fname), [N,N]).astype(np.float32)[np.newaxis, ...]
-        dart = transform.resize(np.load(dart_fname), [N,N]).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
+        mask = transform.resize(np.load(mask_fname), [in_out_shape,in_out_shape]).astype(np.float32)[np.newaxis, ...]
+        dart = transform.resize(np.load(dart_fname), [in_out_shape,in_out_shape]).astype(np.float32)[np.newaxis, ...] #/ resist_thickness # Resist thickness
 
         return mask, dart
 
@@ -331,58 +332,81 @@ def double_conv(in_channels, out_channels):
         nn.ReLU(inplace=True)
     )
 
-class UNet(nn.Module):
-    def __init__(self, n_class=1):
-        super(UNet, self).__init__()
-                
-        self.dconv_down1 = double_conv(1, 64)
-        self.dconv_down2 = double_conv(64, 128)
-        self.dconv_down3 = double_conv(128, 256)
-        self.dconv_down4 = double_conv(256, 512)        
+class Encoder(torch.nn.Module):
+    def __init__(self, c_in, c_out, ksize):
+        super().__init__()
+        self.conv_1 = nn.Sequential(
+            nn.Conv2d(c_in, c_out, ksize, padding=ksize // 2 + 1),
+            nn.LeakyReLU()
+        )
+        self.conv_2 = nn.Sequential(
+            nn.Conv2d(c_out, c_out, ksize, padding=ksize // 2 + 1),
+            nn.LeakyReLU(),
+         )
+        self.pool = nn.MaxPool2d(2)
+        self.BN = nn.BatchNorm2d(c_in)
 
-        self.maxpool = nn.MaxPool2d(2)
-        
-        # Transposed convolutions for upsampling
-        self.up_transpose3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.up_transpose2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.up_transpose1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        
-        self.dconv_up3 = double_conv(256 + 256, 256)  # 256 from upsampled, 256 from conv3
-        self.dconv_up2 = double_conv(128 + 128, 128)  # 128 from upsampled, 128 from conv2
-        self.dconv_up1 = double_conv(64 + 64, 64)     # 64 from upsampled, 64 from conv1
-        
-        self.conv_last = nn.Conv2d(64, n_class, kernel_size=1)
-        
     def forward(self, x):
-        # Down path
-        conv1 = self.dconv_down1(x)
-        x = self.maxpool(conv1)
-
-        conv2 = self.dconv_down2(x)
-        x = self.maxpool(conv2)
-        
-        conv3 = self.dconv_down3(x)
-        x = self.maxpool(conv3)   
-        
-        x = self.dconv_down4(x)
-        
-        # Up path
-        x = self.up_transpose3(x)        
-        x = torch.cat([x, conv3], dim=1)
-        x = self.dconv_up3(x)
-        
-        x = self.up_transpose2(x)        
-        x = torch.cat([x, conv2], dim=1)       
-        x = self.dconv_up2(x)
-        
-        x = self.up_transpose1(x)        
-        x = torch.cat([x, conv1], dim=1)   
-        x = self.dconv_up1(x)
-        
-        out = self.conv_last(x)
-        
-        return out 
+        x = self.BN(x)
+        y = self.conv_1(x)
+        y = self.conv_2(y)
+        y = self.pool(y)
+        return y
     
+class Decoder(torch.nn.Module):
+
+    def __init__(self, c_in, c_out, ksize):
+        super().__init__()
+
+        # self.unpool = nn.MaxUnpool3d(3)
+        self.upconv_1 = nn.Sequential(
+            nn.ConvTranspose2d(c_in, c_out, ksize, padding=ksize // 2 + 1),
+            nn.LeakyReLU()
+        )
+        self.upconv_2 = nn.Sequential(
+            nn.ConvTranspose2d(c_out, c_out, ksize, padding=ksize // 2 + 1),
+            nn.LeakyReLU()
+        )
+        self.BN = nn.BatchNorm2d(c_in)
+
+
+    def forward(self, x):
+        y = nn.functional.interpolate(x, scale_factor=2, mode='bilinear')
+        y = self.BN(y)
+        y = self.upconv_1(y)  
+        y = self.upconv_2(y)  
+        return y
+    
+class UNet(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.setup_architecture()
+    
+    def setup_architecture(self):
+        self.enc_1 = Encoder(1,   9, 3)
+        self.enc_2 = Encoder(9,  18, 3) 
+        self.enc_3 = Encoder(18, 36, 3)
+        # self.enc_4 = Encoder(36, 72, 3)
+
+        # self.dec_4 = Decoder(72, 36, 3)
+        self.dec_3 = Decoder(36, 18, 3)
+        self.dec_2 = Decoder(18,  9, 3)
+        self.dec_1 = Decoder(9, 1, 3)
+
+        # self.output_function = nn.Softmax(dim=1)
+    
+    def forward(self, x):
+        ey1 = self.enc_1(x)
+        ey2 = self.enc_2(ey1)
+        ey3 = self.enc_3(ey2)
+ 
+        dy3 = self.dec_3(ey3)
+        dy2 = self.dec_2(dy3 + ey2)
+        dy1 = self.dec_1(dy2 + ey1)
+        # y = self.output_function(dy1)
+        y = dy1
+        return y
 
 def conv2d(obj, psf, shape="same", intensity_output=False):
     _, _, im_height, im_width = obj.shape
@@ -504,8 +528,8 @@ def train_litho_model(parameters: TrainingParameters) -> UNet:
 
 def optimize_mask(parameters: OptimizationParameters, model: UNet):
 
-    dart_sim = transform.resize(np.load(parameters.target_dart_fname), [104, 104])
-    mask_sim = transform.resize(np.load(parameters.target_mask_fname), [104, 104])
+    dart_sim = transform.resize(np.load(parameters.target_dart_fname),[in_out_shape,in_out_shape])
+    mask_sim = transform.resize(np.load(parameters.target_mask_fname),[in_out_shape,in_out_shape])
 
     # Put everything in tensors
     mask = np.ones_like(mask_sim)*0.5
